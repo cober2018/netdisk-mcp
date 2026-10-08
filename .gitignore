@@ -1,0 +1,9 @@
+.env
+.secrets/
+config.json
+directory_rules.json
+__pycache__/
+*.pyc
+.venv/
+dist/
+*.egg-info/

@@ -1,0 +1,19 @@
+[project]
+name = "netdisk-ingest-mcp"
+version = "0.1.0"
+description = "把夸克/百度分享链接转存到自己的目录，并创建自己的永久分享。供 OpenClaw 上架闲鱼前使用。"
+requires-python = ">=3.10"
+dependencies = [
+  "mcp>=2",
+  "httpx>=0.27",
+]
+
+[project.scripts]
+netdisk-ingest-mcp = "netdisk_mcp.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["netdisk_mcp*"]

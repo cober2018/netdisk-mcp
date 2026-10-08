@@ -1,0 +1,10 @@
+{
+  "quark_root": "/闲鱼资源",
+  "baidu_root": "/闲鱼资源",
+  "fallback": "待分类",
+  "rules": [
+    {"keywords": ["考研", "四六级", "雅思"], "folder": "考试"},
+    {"keywords": ["photoshop", "premiere", "剪辑"], "folder": "软件"},
+    {"keywords": ["小学", "初中", "高考"], "folder": "教育"}
+  ]
+}
