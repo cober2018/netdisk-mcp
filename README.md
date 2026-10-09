@@ -17,7 +17,7 @@
 
 ## 生产配置
 
-凭证只放宿主机环境变量或宿主机文件，不进 git，不写进 Skill。
+凭证只放宿主机环境变量或宿主机文件，不进 git，不写进 Skill。夸克走官方开放平台 OAuth，不使用网页 Cookie。
 
 ```bash
 cd netdisk-mcp
@@ -34,7 +34,9 @@ OpenClaw 注册示例：
     "netdisk-ingest": {
       "command": "netdisk-ingest-mcp",
       "env": {
-        "QUARK_COOKIE": "生产机上的夸克 Cookie",
+        "QUARK_ACCESS_TOKEN": "生产机上的夸克 access_token",
+        "QUARK_REFRESH_TOKEN": "生产机上的夸克 refresh_token",
+        "QUARK_DEVICE_ID": "官方登录返回的 device_id",
         "BAIDU_NETDISK_ACCESS_TOKEN": "生产机上的百度 access_token",
         "NETDISK_RULES_PATH": "/opt/openclaw/directory_rules.json",
         "NETDISK_MIN_INTERVAL_SECONDS": "3"
@@ -44,7 +46,9 @@ OpenClaw 注册示例：
 }
 ```
 
-也可以不把凭证写进 MCP 配置，改为 `QUARK_COOKIE_FILE` 和 `BAIDU_NETDISK_ACCESS_TOKEN_FILE` 指向宿主机密钥文件。
+也可以不把凭证写进 MCP 配置。百度用 `BAIDU_NETDISK_ACCESS_TOKEN_FILE`。夸克用 `QUARK_ACCESS_TOKEN_FILE`、`QUARK_REFRESH_TOKEN_FILE` 和 `QUARK_DEVICE_ID`。如果生产机已经用官方 CLI 登录过，不设置这些变量时会读取 `~/.quarkclouddrive/config.json`。access_token 过期后用 refresh_token 轮换，新令牌写入 `QUARK_OPEN_TOKEN_FILE`（默认 `.secrets/quark_open_token.json`），之后以这个文件为准。
+
+夸克的列目录、建目录、分享详情、转存和创建分享都调用官方接口。转存目录仍由 `directory_rules.json` 算出，并作为 `to_pdir_fid` 传入，不会落到官方的默认目录。分享固定 `expired_type=1`（永久）。私密提取码仍由夸克生成。
 
 百度应用必须在开放平台开通分享转存和创建分享。没开通时，转存会失败并说明原因，不会假装成功。
 
@@ -54,7 +58,7 @@ OpenClaw 注册示例：
 
 | 工具 | 作用 |
 |---|---|
-| `provider_status` | 只报告凭证是否已配置，不返回内容 |
+| `provider_status` | 只报告夸克开放平台授权和百度 token 是否已配置，不返回内容 |
 | `inspect_share_link` | 只读，给出建议目录 |
 | `ingest_share_link` | 转存并创建自己的永久分享 |
 | `create_share_for_saved_folder` | 转存已成功、分享失败时，对那个资源目录补分享 |

@@ -9,7 +9,7 @@ from mcp.server.mcpserver import MCPServer
 
 from netdisk_mcp.baidu import BaiduClient
 from netdisk_mcp.pipeline import create_own_share, ingest_share, inspect_share, public_error, verify_share
-from netdisk_mcp.quark import QuarkClient
+from netdisk_mcp.quark import QuarkClient, quark_auth_configured
 from netdisk_mcp.secrets import read_secret
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -24,12 +24,12 @@ def _dump(payload: dict) -> str:
 
 @mcp.tool()
 def provider_status() -> str:
-    """检查生产机是否配置了夸克 Cookie 和百度 access_token。不返回凭证内容。"""
+    """检查生产机是否配置了夸克开放平台授权和百度 access_token。不返回凭证内容。"""
     quark = False
     baidu = False
     errors = []
     try:
-        quark = bool(read_secret("QUARK_COOKIE", "QUARK_COOKIE_FILE"))
+        quark = quark_auth_configured()
     except RuntimeError as exc:
         errors.append(str(exc))
     try:
