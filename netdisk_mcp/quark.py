@@ -10,6 +10,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 import httpx
 
@@ -82,6 +83,7 @@ class QuarkClient:
         self._sleep = sleep or time.sleep
         self._poll_interval = 1.0
         self._poll_timeout = 15 * 60
+        self._share_page_size = 100
         self._refreshed = False
 
     def list_files(self, parent_fid: str) -> list[dict]:
@@ -170,6 +172,306 @@ class QuarkClient:
         finished = self._wait_task(task_id)
         save_as = finished.get("save_as") or {}
         return list(save_as.get("save_as_top_fids") or finished.get("save_as_top_fids") or [])
+
+    def walk_share_tree(self, pwd_id: str, password: str, max_depth: int = 4, max_entries: int = 2000) -> dict:
+        """只读分享目录树。路径相对内容根：根上只有一个文件夹时，进到该文件夹下面。"""
+        if max_depth < 1 or max_entries < 1:
+            raise QuarkError("max_depth 和 max_entries 必须大于 0")
+        stoken, title, entries, truncated = self._content_root(pwd_id, password)
+        state = {"count": 0, "bytes": 0, "truncated": truncated}
+        tree = self._share_nodes(pwd_id, stoken, entries, "", 1, max_depth, max_entries, state)
+        return {
+            "title": title,
+            "truncated": state["truncated"],
+            "total_entries": state["count"],
+            "total_bytes": state["bytes"],
+            "tree": tree,
+        }
+
+    def resolve_share_paths(self, pwd_id: str, password: str, include_paths: list[str]) -> dict:
+        """按内容根相对路径找 fid。找不到的路径放 missing，不因此中断其它路径。"""
+        stoken, title, entries, _truncated = self._content_root(pwd_id, password)
+        cache: dict[str, list[dict]] = {"": entries}
+        found: list[dict] = []
+        missing: list[str] = []
+        seen: set[str] = set()
+        for raw in include_paths:
+            path = _relative_path(raw)
+            if not path:
+                missing.append(str(raw))
+                continue
+            if path in seen:
+                continue
+            seen.add(path)
+            node = self._lookup_share_path(pwd_id, stoken, cache, path)
+            if node is None:
+                missing.append(path)
+                continue
+            found.append(node)
+        return {"stoken": stoken, "title": title, "found": found, "missing": missing}
+
+    def save_selected(self, pwd_id: str, stoken: str, entries: list[dict], dest_fid: str) -> list[str]:
+        """只转存选中的 fid。save_all 与 fid_list 互斥，这里固定 save_all=false。"""
+        if not entries:
+            raise QuarkError("没有可转存的文件")
+        if not stoken:
+            raise QuarkError("没有分享 stoken，无法转存")
+        if not dest_fid:
+            raise QuarkError("转存必须指定目标目录")
+        saved: list[str] = []
+        chunks = [entries[index : index + 100] for index in range(0, len(entries), 100)]
+        for number, chunk in enumerate(chunks, start=1):
+            fids = [item["fid"] for item in chunk if item.get("fid")]
+            if len(fids) != len(chunk):
+                raise QuarkError("选中的条目缺少 fid，没有转存")
+            tokens = [item.get("share_fid_token") or "" for item in chunk]
+            body: dict[str, Any] = {
+                "pwd_id": pwd_id,
+                "stoken": stoken,
+                "to_pdir_fid": dest_fid,
+                "fid_list": fids,
+                "save_all": False,
+            }
+            if all(tokens):
+                body["fid_token_list"] = tokens
+            PACE.wait()
+            try:
+                data = self._open("POST", "/open/v1/share/saveas", body=body)
+            except QuarkError:
+                if number > 1:
+                    raise QuarkError("子集转存中途失败，目标目录可能已有部分文件，没有创建分享") from None
+                raise
+            task_id = data.get("task_id") or ""
+            if not task_id:
+                if number > 1:
+                    raise QuarkError("子集转存中途失败，目标目录可能已有部分文件，没有创建分享")
+                raise QuarkError("转存没有返回 task_id")
+            finished = self._wait_task(task_id)
+            save_as = finished.get("save_as") or {}
+            saved.extend(save_as.get("save_as_top_fids") or finished.get("save_as_top_fids") or [])
+        return saved
+
+    def collect_files(self, folder_path: str) -> list[dict]:
+        """列出自己网盘目录下的文件。超过 5000 个或目录互相指向时直接失败，不静默截断。"""
+        fid = "0" if folder_path in {"", "/"} else self.resolve_path(folder_path, create=False)
+        found: list[dict] = []
+        self._collect_files(fid, "", found, set(), 0)
+        return found
+
+    def get_download_urls(self, fids: list[str]) -> list[dict]:
+        """批量取自己网盘文件的下载地址。官方没有按分享 fid 下载的接口。"""
+        rows: list[dict] = []
+        for start in range(0, len(fids), 50):
+            chunk = [fid for fid in fids[start : start + 50] if fid]
+            if not chunk:
+                continue
+            PACE.wait()
+            data = self._open_any("POST", "/open/v1/file/multi_get_download_url", body={"fids": chunk})
+            if isinstance(data, list):
+                batch = data
+            elif isinstance(data, dict):
+                batch = data.get("list") or data.get("files") or data.get("file_list") or []
+            else:
+                raise QuarkError("下载地址格式异常")
+            if not isinstance(batch, list):
+                raise QuarkError("下载地址格式异常")
+            rows.extend(item for item in batch if isinstance(item, dict))
+        return rows
+
+    def download_file(self, url: str, dest: Path) -> int:
+        """把已取得的下载地址写入本地临时文件，完成后再换名。限流时只再试一次。"""
+        if not url:
+            raise QuarkError("没有下载地址")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        temporary = dest.with_name(dest.name + ".part")
+        try:
+            for attempt in range(2):
+                PACE.wait()
+                try:
+                    size = self._stream_download(url, temporary)
+                except QuarkError as exc:
+                    if attempt == 0 and "429" in str(exc):
+                        continue
+                    raise
+                os.replace(temporary, dest)
+                return size
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+        raise QuarkError("下载失败")
+
+    def _content_root(self, pwd_id: str, password: str) -> tuple[str, str, list[dict], bool]:
+        stoken, files, title = self._share_files(pwd_id, password)
+        if len(files) == 1 and files[0]["is_folder"]:
+            files, truncated = self._list_share_dir(pwd_id, stoken, files[0]["fid"])
+            return stoken, title, files, truncated
+        return stoken, title, files, False
+
+    def _list_share_dir(self, pwd_id: str, stoken: str, pdir_fid: str) -> tuple[list[dict], bool]:
+        files: list[dict] = []
+        seen: set[str] = set()
+        signatures: set[tuple[str, ...]] = set()
+        page = 1
+        while page <= 500:
+            batch = self._fetch_share_page(pwd_id, stoken, pdir_fid, page)
+            signature = tuple(item["fid"] for item in batch)
+            if signature in signatures:
+                return files, True
+            signatures.add(signature)
+            added = []
+            for item in batch:
+                fid = item["fid"]
+                if fid and fid in seen:
+                    continue
+                if fid:
+                    seen.add(fid)
+                added.append(item)
+            if not added:
+                return files, False
+            files.extend(added)
+            if len(batch) < self._share_page_size:
+                return files, False
+            page += 1
+        return files, True
+
+    def _fetch_share_page(self, pwd_id: str, stoken: str, pdir_fid: str, page: int) -> list[dict]:
+        extra = self._pan(
+            "GET",
+            "/1/clouddrive/share/sharepage/detail",
+            query={
+                "pwd_id": pwd_id,
+                "stoken": stoken,
+                "pdir_fid": pdir_fid or "0",
+                "_page": page,
+                "_size": self._share_page_size,
+                "_fetch_total": 1,
+                "_fetch_share": 1,
+            },
+        )
+        batch = extra.get("list") or (extra.get("detail_info") or {}).get("list") or []
+        if not isinstance(batch, list):
+            raise QuarkError("夸克分享列表格式异常")
+        return [_normalize_file(item) for item in batch]
+
+    def _share_nodes(
+        self,
+        pwd_id: str,
+        stoken: str,
+        entries: list[dict],
+        prefix: str,
+        depth: int,
+        max_depth: int,
+        max_entries: int,
+        state: dict,
+    ) -> list[dict]:
+        nodes = []
+        for item in entries:
+            if state["count"] >= max_entries:
+                state["truncated"] = True
+                break
+            name = item["name"]
+            path = f"{prefix}/{name}" if prefix else name
+            size = 0 if item["is_folder"] else int(item.get("size") or 0)
+            state["count"] += 1
+            state["bytes"] += size
+            node = {
+                "name": f"{name}/" if item["is_folder"] else name,
+                "path": path,
+                "is_folder": item["is_folder"],
+                "size": size,
+            }
+            if item["is_folder"]:
+                if depth >= max_depth:
+                    state["truncated"] = True
+                    node["child_count"] = 0
+                    node["children"] = []
+                else:
+                    children, truncated = self._list_share_dir(pwd_id, stoken, item["fid"])
+                    if truncated:
+                        state["truncated"] = True
+                    node["children"] = self._share_nodes(
+                        pwd_id, stoken, children, path, depth + 1, max_depth, max_entries, state
+                    )
+                    node["child_count"] = len(node["children"])
+            else:
+                node["child_count"] = 0
+            nodes.append(node)
+        return nodes
+
+    def _lookup_share_path(self, pwd_id: str, stoken: str, cache: dict[str, list[dict]], path: str) -> dict | None:
+        current = cache[""]
+        parent = ""
+        node = None
+        parts = path.split("/")
+        for index, part in enumerate(parts):
+            node = next((item for item in current if item["name"] == part), None)
+            if node is None:
+                return None
+            here = f"{parent}/{part}" if parent else part
+            if index == len(parts) - 1:
+                selected = dict(node)
+                selected["path"] = here
+                return selected
+            if not node["is_folder"]:
+                return None
+            if here not in cache:
+                children, _truncated = self._list_share_dir(pwd_id, stoken, node["fid"])
+                cache[here] = children
+            current = cache[here]
+            parent = here
+        return None
+
+    def _collect_files(self, fid: str, prefix: str, found: list[dict], seen: set[str], depth: int) -> None:
+        if not fid or fid in seen:
+            return
+        if depth > 12:
+            raise QuarkError("目录层级过深，已停止，避免循环")
+        seen.add(fid)
+        for item in self.list_files(fid):
+            rel = f"{prefix}/{item['name']}" if prefix else item["name"]
+            if item["is_folder"]:
+                self._collect_files(item["fid"], rel, found, seen, depth + 1)
+                continue
+            found.append(
+                {
+                    "fid": item["fid"],
+                    "name": item["name"],
+                    "path": rel,
+                    "size": int(item.get("size") or 0),
+                }
+            )
+            if len(found) > 5000:
+                raise QuarkError("目录超过 5000 个文件，请用 include_paths 缩小范围")
+
+    def _stream_download(self, url: str, temporary: Path) -> int:
+        headers = _download_headers(url, self.auth.access_token)
+        size = 0
+        try:
+            with httpx.Client(timeout=120.0, transport=self._transport, follow_redirects=True) as client:
+                with client.stream("GET", url, headers=headers) as response:
+                    if response.status_code == 429:
+                        raise QuarkError("下载被限流（HTTP 429）")
+                    if response.status_code >= 400:
+                        raise QuarkError(f"下载失败（HTTP {response.status_code}）")
+                    with temporary.open("wb") as handle:
+                        for chunk in response.iter_bytes():
+                            if not chunk:
+                                continue
+                            handle.write(chunk)
+                            size += len(chunk)
+        except QuarkError:
+            raise
+        except Exception as exc:
+            raise QuarkError("下载失败") from exc
+        return size
+
+    def _open_any(self, method: str, path: str, *, query: dict | None = None, body: dict | None = None):
+        self._ensure_fresh()
+        payload, http_status = self._signed(method, path, query=query, body=body, with_access_token=True)
+        if _auth_failed(payload, http_status) and self.auth.refresh_token and not self._refreshed:
+            self._refresh()
+            payload, http_status = self._signed(method, path, query=query, body=body, with_access_token=True)
+        return _open_value(payload, http_status)
 
     def create_share(self, fid: str, title: str, url_type: int = 1) -> dict:
         """用自己网盘里的 fid 创建分享。expired_type 固定为 1（永久）。"""
@@ -397,15 +699,22 @@ def _auth_failed(payload: dict, http_status: int) -> bool:
 
 
 def _open_data(payload: dict, http_status: int) -> dict:
+    data = _open_value(payload, http_status)
+    if not isinstance(data, dict):
+        raise QuarkError("夸克接口没有返回 data")
+    return data
+
+
+def _open_value(payload: dict, http_status: int):
     status = payload.get("status", 0)
     if http_status >= 400 or status not in (0, None):
         message = payload.get("agent_msg") or payload.get("error_info") or payload.get("message") or "未知错误"
         errno = payload.get("errno", status)
         raise QuarkError(f"夸克接口失败: {message} (code={errno})")
     data = payload.get("data")
-    if not isinstance(data, dict):
-        raise QuarkError("夸克接口没有返回 data")
-    return data
+    if isinstance(data, (dict, list)):
+        return data
+    raise QuarkError("夸克接口没有返回 data")
 
 
 def _pan_data(payload: dict, http_status: int) -> dict:
@@ -418,6 +727,24 @@ def _pan_data(payload: dict, http_status: int) -> dict:
         raise QuarkError(f"夸克分享接口失败: {message} (code={code})")
     data = payload.get("data") or {}
     return data if isinstance(data, dict) else {}
+
+
+def _relative_path(value: str) -> str:
+    text = str(value or "").strip().replace("\\", "/").strip("/")
+    if not text or text in {".", ".."}:
+        return ""
+    parts = [part for part in text.split("/") if part not in {"", "."}]
+    if any(part == ".." for part in parts):
+        raise QuarkError("路径不能包含 ..")
+    return "/".join(parts)
+
+
+def _download_headers(url: str, access_token: str) -> dict:
+    host = (urlparse(url).hostname or "").lower()
+    suffixes = ("quark.cn", "uc.cn", "aliyuncs.com", "alibaba.com")
+    if not access_token or not any(host == item or host.endswith("." + item) for item in suffixes):
+        return {}
+    return {"Cookie": f"x_pan_client_id={CLIENT_ID};x_pan_access_token={access_token}"}
 
 
 def _normalize_file(item: dict) -> dict:

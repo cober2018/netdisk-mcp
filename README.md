@@ -64,8 +64,58 @@ OpenClaw 注册示例：
 | `create_share_for_saved_folder` | 转存已成功、分享失败时，对那个资源目录补分享 |
 | `verify_share_link` | 回读分享，确认里面有文件 |
 | `list_directory` | 列自己的目录，不会顺手创建目录 |
+| `inspect_share_tree` | 只读。递归列出夸克分享目录树，不转存 |
+| `selective_ingest` | 只转存夸克分享里选中的路径，再创建自己的永久分享 |
+| `download_share_files` | 把夸克文件下载到本地。分享链接会先把选中项转存到下载缓存，不创建分享 |
 
-`ingest_share_link` 发现目标资源目录已经有文件时会停下，避免把旧文件和新文件打成同一条分享。
+`ingest_share_link` 发现目标资源目录已经有文件时会停下，避免把旧文件和新文件打成同一条分享。`selective_ingest` 使用同一条规则。
+
+## 从大合集精选上架
+
+`include_paths` 是分享**内容根**下的相对路径，不是源 URL，也不包含分享标题那一层。如果分享根只有一个文件夹，内容根就是这个文件夹里面；否则内容根就是分享根列出的那些条目。
+
+先看树，再转存选中的子目录。下面只转存「抖音电商」这一个子合集：
+
+```text
+inspect_share_tree(share_url="https://pan.quark.cn/s/xxxx", max_depth=2, max_entries=2000)
+
+selective_ingest(
+  share_url="https://pan.quark.cn/s/xxxx",
+  include_paths=["11-Codex Skills｜抖音电商抖店平台skills技能库集合"],
+  category="技能",
+  title="抖音电商与抖店平台 Skills 技能库"
+)
+```
+
+路径可以多选，顺序无关。匹配不到的放进 `skipped_missing`，其余继续。一个都匹配不到，或者 `include_paths` 为空，会直接失败，不会做出空分享。选中一个目录时，转存的是这个目录本身，不是把它拆成散文件。
+
+官方转存接口支持子集：`/open/v1/share/saveas` 的 `fid_list` 和 `save_all` 互斥。这里固定 `save_all=false`，并只在每个选中项都有 `share_fid_token` 时附带 `fid_token_list`。不采用「先整包转存再移动」，避免失败时留下一整份临时副本。一次最多提交 100 个 fid；后一批失败时不会创建分享，目标目录里可能已经有前面成功的那一批。
+
+目标目录必须是 `{根目录}/{分类}/{资源名}`。品类目录或根目录会被拒绝。目录里已经有文件也会拒绝，同一批路径再调一次会因为目录非空而失败，不会混进去。
+
+分享创建失败或回读发现是空的时，返回里有 `saved=true` 和 `dest_path`，没有可上架的 `share_url`。接着用 `create_share_for_saved_folder` 只对这个资源目录补永久分享。
+
+到达 `max_depth` 的文件夹不会继续打开，`truncated` 为 true。分页若重复返回同一页，会停下来并标成截断，不会死循环。
+
+## 转存后下载到本地
+
+官方开放平台没有「直接下载别人分享里的文件」的接口，只有对自己网盘文件的批量地址：`/open/v1/file/multi_get_download_url`，每批最多 50 个。拿到地址后按文件串行下载。
+
+自己网盘里的目录直接传绝对路径。`include_paths` 为空表示下载该目录下的全部文件；非空时相对这个目录。传入分享链接时，只会把选中项转存到 `{根目录}/下载缓存/{分享标题}`，然后下载，**不创建分享**。这个缓存目录若已有文件，会拒绝混入；这时把该路径再传一次，即可直接下载已经转存的文件。
+
+```text
+download_share_files(
+  share_url_or_dest_path="/闲鱼资源/技能/抖音电商与抖店平台 Skills 技能库",
+  include_paths=[],
+  local_dir="/Users/you/Downloads/skills-douyin",
+  max_files=10,
+  max_total_mb=200
+)
+```
+
+建议先把 `max_files` 设为 10 看限流，再放开。`max_files` 和 `max_total_mb` 是硬上限，一触顶就停止，剩下的进 `skipped` 并写明原因。同名文件默认跳过，只有 `overwrite=true` 才覆盖。`local_dir` 必须是绝对路径，不能包含 `..`，也不能是符号链接。
+
+下载和转存共用 `NETDISK_MIN_INTERVAL_SECONDS`（默认 3 秒）。官方 CLI 也是串行取文件，没有公布「第 N 个文件必定被封」的数字，这里没有对生产账号做批量压测。遇到 HTTP 429 时同一文件只再试一次；连续 3 个文件失败就中断，避免把账号打进风控。不要并行下载。
 
 ## 分享规则
 

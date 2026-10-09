@@ -8,7 +8,16 @@ import logging
 from mcp.server.mcpserver import MCPServer
 
 from netdisk_mcp.baidu import BaiduClient
-from netdisk_mcp.pipeline import create_own_share, ingest_share, inspect_share, public_error, verify_share
+from netdisk_mcp.pipeline import (
+    create_own_share,
+    download_share_files as save_downloaded_files,
+    ingest_share,
+    inspect_share,
+    inspect_share_tree as read_share_tree,
+    public_error,
+    selective_ingest as ingest_selection,
+    verify_share,
+)
 from netdisk_mcp.quark import QuarkClient, quark_auth_configured
 from netdisk_mcp.secrets import read_secret
 
@@ -77,6 +86,78 @@ def verify_share_link(share_url: str, password: str = "") -> str:
     """回读一条分享，确认里面真有文件。上架前如果 ingest 已经 verified=true，不必再调。"""
     try:
         return _dump(verify_share(share_url, password=password))
+    except Exception as exc:  # noqa: BLE001
+        return _dump(public_error(exc))
+
+
+@mcp.tool()
+def inspect_share_tree(share_url: str, password: str = "", max_depth: int = 4, max_entries: int = 2000) -> str:
+    """只读。递归列出夸克分享的目录树，不转存、不创建分享。路径相对内容根，不含分享标题那一层。
+
+    max_depth 或 max_entries 触顶时 truncated 为 true。
+    """
+    try:
+        return _dump(read_share_tree(share_url, password=password, max_depth=max_depth, max_entries=max_entries))
+    except Exception as exc:  # noqa: BLE001
+        return _dump(public_error(exc))
+
+
+@mcp.tool()
+def selective_ingest(
+    share_url: str,
+    include_paths: list[str],
+    category: str = "",
+    dest_path: str = "",
+    title: str = "",
+    private: bool = False,
+) -> str:
+    """只转存夸克分享里指定的相对路径，再为这个资源目录创建自己的永久分享。
+
+    include_paths 相对内容根，不是源 URL，也不含分享标题目录。空列表会拒绝，不会产出空分享。
+    目标目录已有文件时拒绝混入。分享失败但转存已成功时，返回 dest_path，交给 create_share_for_saved_folder。
+    """
+    try:
+        return _dump(
+            ingest_selection(
+                share_url,
+                include_paths,
+                category=category,
+                dest_path=dest_path,
+                title=title,
+                private=private,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _dump(public_error(exc))
+
+
+@mcp.tool()
+def download_share_files(
+    share_url_or_dest_path: str,
+    include_paths: list[str] | None = None,
+    local_dir: str = "",
+    max_files: int = 50,
+    max_total_mb: int = 200,
+    make_zip: bool = False,
+    overwrite: bool = False,
+) -> str:
+    """把夸克文件下载到 local_dir。传入自己的目录路径时直接下载；传入分享链接时只转存选中项到下载缓存，不创建分享。
+
+    include_paths 为空表示该目录下全部。超过 max_files 或 max_total_mb 即停止，其余记入 skipped。
+    建议先用 max_files=10 试跑。连续失败 3 次会中断。
+    """
+    try:
+        return _dump(
+            save_downloaded_files(
+                share_url_or_dest_path,
+                include_paths=include_paths,
+                local_dir=local_dir,
+                max_files=max_files,
+                max_total_mb=max_total_mb,
+                make_zip=make_zip,
+                overwrite=overwrite,
+            )
+        )
     except Exception as exc:  # noqa: BLE001
         return _dump(public_error(exc))
 
