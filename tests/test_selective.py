@@ -147,7 +147,14 @@ class ApiTests(unittest.TestCase):
                     return httpx.Response(404, json={"status": 1, "error_info": "unexpected download request"})
                 return httpx.Response(
                     200,
-                    json={"status": 0, "data": {"fid": "a", "download_url": "https://dl.quark.cn/a", "file_name": "a.txt"}},
+                    json={
+                        "status": 0,
+                        "data": {
+                            "fid": "download-state-a|suffix",
+                            "download_url": "https://dl.quark.cn/a",
+                            "file_name": "a.txt",
+                        },
+                    },
                 )
             if request.url.host == "dl.quark.cn":
                 return httpx.Response(200, content=b"hello")
@@ -159,6 +166,7 @@ class ApiTests(unittest.TestCase):
         rows = client.get_download_urls(["a"])
         self.assertEqual(json.loads(self.seen[0].content), {"fid": "a"})
         self.assertEqual(urlparse(str(self.seen[0].url)).path, "/open/v1/file/get_download_url")
+        self.assertEqual(rows[0]["fid"], "a")
         self.assertEqual(rows[0]["download_url"], "https://dl.quark.cn/a")
         with tempfile.TemporaryDirectory() as directory:
             dest = Path(directory) / "a.txt"
@@ -170,6 +178,32 @@ class ApiTests(unittest.TestCase):
             client.download_file("https://example.com/file", Path(directory) / "b.txt")
             plain = next(item for item in self.seen if item.url.host == "example.com")
             self.assertNotIn("cookie", {key.lower() for key in plain.headers})
+
+    def test_download_url_failure_is_isolated_and_429_retried_once(self):
+        calls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = urlparse(str(request.url)).path
+            if not path.endswith("/get_download_url"):
+                return httpx.Response(404, json={"status": 1, "error_info": "missing"})
+            fid = json.loads(request.content)["fid"]
+            calls.append(fid)
+            if fid == "bad":
+                return httpx.Response(200, json={"status": 1, "errno": 1, "error_info": "文件被风控"})
+            if fid == "rate" and calls.count("rate") == 1:
+                return httpx.Response(429, json={"status": 1, "error_info": "too many"})
+            return httpx.Response(
+                200,
+                json={"status": 0, "data": {"fid": "download-state", "download_url": f"https://dl.quark.cn/{fid}"}},
+            )
+
+        rows = self._client(handler).get_download_urls(["good", "bad", "rate"])
+        self.assertEqual([row["fid"] for row in rows], ["good", "bad", "rate"])
+        self.assertEqual(rows[0]["download_url"], "https://dl.quark.cn/good")
+        self.assertEqual(rows[1]["download_url"], "")
+        self.assertIn("文件被风控", rows[1]["error"])
+        self.assertEqual(rows[2]["download_url"], "https://dl.quark.cn/rate")
+        self.assertEqual(calls.count("rate"), 2)
 
 
 class SelectionTests(unittest.TestCase):
@@ -308,6 +342,21 @@ class DownloadTests(unittest.TestCase):
         self.assertNotIn("share", [call[0] for call in self.fake.calls])
         self.assertIn("/下载缓存/", self.fake.calls[[call[0] for call in self.fake.calls].index("ensure")][1])
 
+    def test_url_error_records_reason_and_downloads_rest(self):
+        original = self.fake.get_download_urls
+
+        def with_failure(fids):
+            rows = original(fids)
+            rows[0]["download_url"] = ""
+            rows[0]["error"] = "文件被风控"
+            return rows
+
+        self.fake.get_download_urls = with_failure
+        result = download_share_files("/闲鱼资源/技能/抖音技能", [], str(self.local), max_files=10, max_total_mb=20)
+        self.assertEqual(result["downloaded"], 4)
+        self.assertEqual(result["errors"][0]["reason"], "文件被风控")
+        self.assertEqual(len(result["errors"]), 1)
+
     def test_symlink_local_dir_is_rejected(self):
         real = Path(self.directory.name) / "real"
         real.mkdir()
@@ -374,7 +423,10 @@ class FakeQuark:
 
     def get_download_urls(self, fids):
         self.calls.append(("urls", list(fids)))
-        return [{"fid": fid, "download_url": f"https://dl.quark.cn/{fid}", "file_name": fid} for fid in fids]
+        return [
+            {"fid": f"download-state-{fid}|suffix", "download_url": f"https://dl.quark.cn/{fid}", "file_name": fid}
+            for fid in fids
+        ]
 
     def download_file(self, url, dest):
         self.calls.append(("get", url))

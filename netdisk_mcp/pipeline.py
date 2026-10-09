@@ -325,22 +325,17 @@ def _download_files(
         pending.append((item, target))
     chosen, quota_skipped, _planned = _apply_quota(pending, max_files, max_total_mb)
     skipped.extend(quota_skipped)
-    urls: dict[str, str] = {}
-    if chosen:
-        for row in client.get_download_urls([item["fid"] for item, _target in chosen]):
-            fid = str(row.get("fid") or "")
-            url = row.get("download_url") or ""
-            if fid and url:
-                urls[fid] = url
+    rows = client.get_download_urls([item["fid"] for item, _target in chosen]) if chosen else []
     downloaded = 0
     total_bytes = 0
     errors: list[dict] = []
     written: list[Path] = []
     streak = 0
-    for item, target in chosen:
-        url = urls.get(str(item["fid"])) or ""
+    for index, (item, target) in enumerate(chosen):
+        row = rows[index] if index < len(rows) else {}
+        url = str(row.get("download_url") or "")
         if not url:
-            errors.append({"name": item["name"], "reason": "没有下载地址"})
+            errors.append({"name": item["name"], "reason": str(row.get("error") or "没有下载地址")})
             streak += 1
         else:
             try:

@@ -259,21 +259,39 @@ class QuarkClient:
         return found
 
     def get_download_urls(self, fids: list[str]) -> list[dict]:
-        """逐个取自己网盘文件的下载地址。官方 read-file 走 get_download_url，不走批量接口。"""
+        """逐个取下载地址。返回顺序与 fids 一致，fid 用请求值。
+
+        单文件接口返回的是下载态 fid，前缀和存储 fid 不同，不能用来回查。
+        单个文件失败不中断整批，原因写在该行的 error 字段。
+        """
         rows: list[dict] = []
         for fid in fids:
             if not fid:
+                rows.append({"fid": "", "download_url": "", "error": "文件缺少 fid，没有取下载地址"})
                 continue
-            PACE.wait()
-            data = self._open_download("/open/v1/file/get_download_url", {"fid": fid})
-            if isinstance(data, dict) and (data.get("download_url") or data.get("fid")):
-                rows.append(data)
-                continue
-            if isinstance(data, list):
-                rows.extend(item for item in data if isinstance(item, dict))
-                continue
-            raise QuarkError("下载地址格式异常")
+            rows.append(self._fetch_download_row(fid))
         return rows
+
+    def _fetch_download_row(self, fid: str) -> dict:
+        message = "取下载地址失败"
+        for attempt in range(2):
+            PACE.wait()
+            try:
+                data = self._open_download("/open/v1/file/get_download_url", {"fid": fid})
+            except QuarkError as exc:
+                message = str(exc)
+                if attempt == 0 and "429" in message:
+                    continue
+                break
+            except Exception:
+                break
+            if isinstance(data, dict):
+                row = dict(data)
+                row["fid"] = fid
+                return row
+            message = "下载地址格式异常"
+            break
+        return {"fid": fid, "download_url": "", "error": message}
 
     def download_file(self, url: str, dest: Path) -> int:
         """把已取得的下载地址写入本地临时文件，完成后再换名。限流时只再试一次。"""
@@ -474,7 +492,12 @@ class QuarkClient:
         if _auth_failed(payload, http_status) and self.auth.refresh_token and not self._refreshed:
             self._refresh()
             payload, http_status = send()
-        return _open_value(payload, http_status)
+        try:
+            return _open_value(payload, http_status)
+        except QuarkError as exc:
+            if http_status == 429:
+                raise QuarkError(f"{exc}（HTTP 429）") from None
+            raise
 
     def create_share(self, fid: str, title: str, url_type: int = 1) -> dict:
         """用自己网盘里的 fid 创建分享。expired_type 固定为 1（永久）。"""
