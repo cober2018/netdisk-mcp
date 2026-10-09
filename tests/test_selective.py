@@ -140,10 +140,14 @@ class ApiTests(unittest.TestCase):
         def handler(request: httpx.Request) -> httpx.Response:
             self.seen.append(request)
             path = urlparse(str(request.url)).path
-            if path.endswith("/multi_get_download_url"):
+            if path.endswith("/get_download_url"):
+                body = json.loads(request.content)
+                query = parse_qs(urlparse(str(request.url)).query)
+                if body.get("fid") != "a" or "fids" in body or "device_id" in query or "access_token" not in query:
+                    return httpx.Response(404, json={"status": 1, "error_info": "unexpected download request"})
                 return httpx.Response(
                     200,
-                    json={"status": 0, "data": [{"fid": "a", "download_url": "https://dl.quark.cn/a", "file_name": "a.txt"}]},
+                    json={"status": 0, "data": {"fid": "a", "download_url": "https://dl.quark.cn/a", "file_name": "a.txt"}},
                 )
             if request.url.host == "dl.quark.cn":
                 return httpx.Response(200, content=b"hello")
@@ -153,7 +157,8 @@ class ApiTests(unittest.TestCase):
 
         client = self._client(handler)
         rows = client.get_download_urls(["a"])
-        self.assertEqual(json.loads(self.seen[0].content)["fids"], ["a"])
+        self.assertEqual(json.loads(self.seen[0].content), {"fid": "a"})
+        self.assertEqual(urlparse(str(self.seen[0].url)).path, "/open/v1/file/get_download_url")
         self.assertEqual(rows[0]["download_url"], "https://dl.quark.cn/a")
         with tempfile.TemporaryDirectory() as directory:
             dest = Path(directory) / "a.txt"

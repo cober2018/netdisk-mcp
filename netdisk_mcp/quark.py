@@ -259,23 +259,20 @@ class QuarkClient:
         return found
 
     def get_download_urls(self, fids: list[str]) -> list[dict]:
-        """批量取自己网盘文件的下载地址。官方没有按分享 fid 下载的接口。"""
+        """逐个取自己网盘文件的下载地址。官方 read-file 走 get_download_url，不走批量接口。"""
         rows: list[dict] = []
-        for start in range(0, len(fids), 50):
-            chunk = [fid for fid in fids[start : start + 50] if fid]
-            if not chunk:
+        for fid in fids:
+            if not fid:
                 continue
             PACE.wait()
-            data = self._open_any("POST", "/open/v1/file/multi_get_download_url", body={"fids": chunk})
+            data = self._open_download("/open/v1/file/get_download_url", {"fid": fid})
+            if isinstance(data, dict) and (data.get("download_url") or data.get("fid")):
+                rows.append(data)
+                continue
             if isinstance(data, list):
-                batch = data
-            elif isinstance(data, dict):
-                batch = data.get("list") or data.get("files") or data.get("file_list") or []
-            else:
-                raise QuarkError("下载地址格式异常")
-            if not isinstance(batch, list):
-                raise QuarkError("下载地址格式异常")
-            rows.extend(item for item in batch if isinstance(item, dict))
+                rows.extend(item for item in data if isinstance(item, dict))
+                continue
+            raise QuarkError("下载地址格式异常")
         return rows
 
     def download_file(self, url: str, dest: Path) -> int:
@@ -465,12 +462,18 @@ class QuarkClient:
             raise QuarkError("下载失败") from exc
         return size
 
-    def _open_any(self, method: str, path: str, *, query: dict | None = None, body: dict | None = None):
+    def _open_download(self, path: str, body: dict):
+        """下载地址接口和列目录不是同一套 query。官方只带 req_id 和 access_token，不带 device_id。"""
+
+        def send() -> tuple[dict, int]:
+            query = {"req_id": str(uuid.uuid4()), "access_token": self.auth.access_token}
+            return self._send("POST", OPEN_API + path, query=query, body=body, sign_path=path)
+
         self._ensure_fresh()
-        payload, http_status = self._signed(method, path, query=query, body=body, with_access_token=True)
+        payload, http_status = send()
         if _auth_failed(payload, http_status) and self.auth.refresh_token and not self._refreshed:
             self._refresh()
-            payload, http_status = self._signed(method, path, query=query, body=body, with_access_token=True)
+            payload, http_status = send()
         return _open_value(payload, http_status)
 
     def create_share(self, fid: str, title: str, url_type: int = 1) -> dict:

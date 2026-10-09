@@ -99,7 +99,7 @@ selective_ingest(
 
 ## 转存后下载到本地
 
-官方开放平台没有「直接下载别人分享里的文件」的接口，只有对自己网盘文件的批量地址：`/open/v1/file/multi_get_download_url`，每批最多 50 个。拿到地址后按文件串行下载。
+官方开放平台没有「直接下载别人分享里的文件」的接口。官方 CLI 的 read-file 对每个自己网盘里的 fid 单独调用 `POST /open/v1/file/get_download_url`，请求体是 `{"fid":"..."}`，查询串只有 `req_id` 和 `access_token`。签名仍是 `SHA256(POST&/open/v1/file/get_download_url&毫秒时间戳&signKey)`，头是 `x-pan-client-id`、`x-pan-tm`、`x-pan-token`。批量接口 `multi_get_download_url` 在同一套签名下会返回 `10001 签名验证失败`，这里不再调用。拿到地址后按文件串行下载。
 
 自己网盘里的目录直接传绝对路径。`include_paths` 为空表示下载该目录下的全部文件；非空时相对这个目录。传入分享链接时，只会把选中项转存到 `{根目录}/下载缓存/{分享标题}`，然后下载，**不创建分享**。这个缓存目录若已有文件，会拒绝混入；这时把该路径再传一次，即可直接下载已经转存的文件。
 
