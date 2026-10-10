@@ -91,6 +91,8 @@ selective_ingest(
 
 官方转存接口支持子集：`/open/v1/share/saveas` 的 `fid_list` 和 `save_all` 互斥。这里固定 `save_all=false`，并只在每个选中项都有 `share_fid_token` 时附带 `fid_token_list`。不采用「先整包转存再移动」，避免失败时留下一整份临时副本。一次最多提交 100 个 fid；后一批失败时不会创建分享，目标目录里可能已经有前面成功的那一批。
 
+任务轮询 `query_task` 偶发被网关以 10001 拒绝时会自动重试；重试仍失败时改用列目录确认转存是否已落地，目录里有文件就继续走分享。转存阶段失败时返回 `dest_path` 和补救指引，先用 `list_directory` 确认，非空就调 `create_share_for_saved_folder` 补永久分享。
+
 目标目录必须是 `{根目录}/{分类}/{资源名}`。品类目录或根目录会被拒绝。目录里已经有文件也会拒绝，同一批路径再调一次会因为目录非空而失败，不会混进去。
 
 分享创建失败或回读发现是空的时，返回里有 `saved=true` 和 `dest_path`，没有可上架的 `share_url`。接着用 `create_share_for_saved_folder` 只对这个资源目录补永久分享。

@@ -169,9 +169,22 @@ class QuarkClient:
         task_id = data.get("task_id") or ""
         if not task_id:
             raise QuarkError("转存没有返回 task_id")
-        finished = self._wait_task(task_id)
+        try:
+            finished = self._wait_task(task_id)
+        except QuarkError:
+            if self._saved_by_listing(dest_fid):
+                return []
+            raise
         save_as = finished.get("save_as") or {}
         return list(save_as.get("save_as_top_fids") or finished.get("save_as_top_fids") or [])
+
+    def _saved_by_listing(self, dest_fid: str) -> bool:
+        """轮询不可用时，用列目录确认转存是否已经落地。"""
+        self._sleep(self._poll_interval)
+        try:
+            return bool(self.list_files(dest_fid))
+        except QuarkError:
+            return False
 
     def walk_share_tree(self, pwd_id: str, password: str, max_depth: int = 4, max_entries: int = 2000) -> dict:
         """只读分享目录树。路径相对内容根：根上只有一个文件夹时，进到该文件夹下面。"""
@@ -246,7 +259,14 @@ class QuarkClient:
                 if number > 1:
                     raise QuarkError("子集转存中途失败，目标目录可能已有部分文件，没有创建分享")
                 raise QuarkError("转存没有返回 task_id")
-            finished = self._wait_task(task_id)
+            try:
+                finished = self._wait_task(task_id)
+            except QuarkError:
+                if self._saved_by_listing(dest_fid):
+                    continue
+                if number > 1:
+                    raise QuarkError("子集转存中途失败，目标目录可能已有部分文件，没有创建分享") from None
+                raise
             save_as = finished.get("save_as") or {}
             saved.extend(save_as.get("save_as_top_fids") or finished.get("save_as_top_fids") or [])
         return saved
@@ -582,8 +602,18 @@ class QuarkClient:
 
     def _wait_task(self, task_id: str) -> dict[str, Any]:
         deadline = time.monotonic() + self._poll_timeout
+        refused = 0
         while True:
-            data = self._open("GET", "/open/v1/file/query_task", query={"task_id": task_id})
+            try:
+                data = self._open("GET", "/open/v1/file/query_task", query={"task_id": task_id})
+            except QuarkError as exc:
+                # query_task 会被网关偶发以 10001 拒绝，隔一个轮询周期再试
+                if "10001" in str(exc) and refused < 5:
+                    refused += 1
+                    self._sleep(self._poll_interval)
+                    continue
+                raise
+            refused = 0
             status = data.get("status")
             if status == 2:
                 return data

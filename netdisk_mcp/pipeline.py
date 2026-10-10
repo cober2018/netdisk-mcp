@@ -195,7 +195,26 @@ def selective_ingest(
     dest_fid = client.ensure_path(dest)
     if client.list_files(dest_fid):
         raise IngestError(f"资源目录已存在且非空，拒绝混入后整目录分享: {dest}")
-    client.save_selected(link.key, resolved["stoken"], resolved["found"], dest_fid)
+    try:
+        client.save_selected(link.key, resolved["stoken"], resolved["found"], dest_fid)
+    except QuarkError as exc:
+        return {
+            "ok": False,
+            "saved": "unknown",
+            "error": str(exc),
+            "provider": "quark",
+            "source_url": link.url,
+            "title": share_title,
+            "category": chosen,
+            "dest_path": dest,
+            "shared_folder_id": str(dest_fid),
+            "selected_count": len(resolved["found"]),
+            "skipped_missing": resolved["missing"],
+            "next": (
+                "转存状态未知。先用 list_directory 查看 dest_path：非空说明转存已落地，"
+                "调用 create_share_for_saved_folder 补永久分享；为空则处理掉空目录后重试 selective_ingest。"
+            ),
+        }
     try:
         share = client.create_share(dest_fid, share_title, 2 if private else 1)
         checked = client.verify(_pwd_id(share), share["passcode"])

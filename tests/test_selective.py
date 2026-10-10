@@ -205,6 +205,46 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(rows[2]["download_url"], "https://dl.quark.cn/rate")
         self.assertEqual(calls.count("rate"), 2)
 
+    def test_query_task_signature_error_is_retried(self):
+        polls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = urlparse(str(request.url)).path
+            if path.endswith("/share/saveas"):
+                return httpx.Response(200, json={"status": 0, "data": {"task_id": "task-1"}})
+            if path.endswith("/query_task"):
+                polls["n"] += 1
+                if polls["n"] <= 2:
+                    return httpx.Response(200, json={"status": 1, "errno": 10001, "error_info": "签名验证失败，禁止访问"})
+                return httpx.Response(
+                    200, json={"status": 0, "data": {"status": 2, "save_as": {"save_as_top_fids": ["new-1"]}}}
+                )
+            return httpx.Response(404, json={"status": 1, "error_info": "missing"})
+
+        saved = self._client(handler).save_entries("pwd", "stoken", [{"fid": "f1"}], "dest-fid")
+        self.assertEqual(polls["n"], 3)
+        self.assertEqual(saved, ["new-1"])
+
+    def test_save_survives_query_task_outage_when_dest_has_files(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = urlparse(str(request.url)).path
+            if path.endswith("/share/saveas"):
+                return httpx.Response(200, json={"status": 0, "data": {"task_id": "task-1"}})
+            if path.endswith("/query_task"):
+                return httpx.Response(200, json={"status": 1, "errno": 10001, "error_info": "签名验证失败，禁止访问"})
+            if path.endswith("/file/list"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": 0,
+                        "data": {"last_page": True, "file_list": [{"fid": "new-1", "filename": "a.pdf", "file_type": "1", "size": 3}]},
+                    },
+                )
+            return httpx.Response(404, json={"status": 1, "error_info": "missing"})
+
+        saved = self._client(handler).save_entries("pwd", "stoken", [{"fid": "f1"}], "dest-fid")
+        self.assertEqual(saved, [])
+
 
 class SelectionTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -272,6 +312,15 @@ class SelectionTests(unittest.TestCase):
         self.fake.verify_error = "新分享可以打开，但里面没有文件，不能上架"
         result = selective_ingest("https://pan.quark.cn/s/abc", ["抖音"], category="技能")
         self.assertFalse(result["ok"])
+        self.assertNotIn("share_url", result)
+
+    def test_save_failure_returns_dest_for_manual_followup(self):
+        self.fake.save_error = "夸克接口失败: 签名验证失败，禁止访问 (code=10001)"
+        result = selective_ingest("https://pan.quark.cn/s/abc", ["抖音"], category="技能", title="抖音技能")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["saved"], "unknown")
+        self.assertEqual(result["dest_path"], "/闲鱼资源/技能/抖音技能")
+        self.assertIn("create_share_for_saved_folder", result["next"])
         self.assertNotIn("share_url", result)
 
 
@@ -374,6 +423,7 @@ class FakeQuark:
         self.fail = False
         self.share_error = ""
         self.verify_error = ""
+        self.save_error = ""
         self.resolved = {
             "stoken": "st",
             "title": "技能合集",
@@ -404,6 +454,8 @@ class FakeQuark:
 
     def save_selected(self, pwd_id, stoken, entries, dest_fid):
         self.calls.append(("save", dest_fid, [item["fid"] for item in entries]))
+        if self.save_error:
+            raise QuarkError(self.save_error)
         return ["new"]
 
     def create_share(self, fid, title, url_type=1):
