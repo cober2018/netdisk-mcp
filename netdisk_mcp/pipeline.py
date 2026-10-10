@@ -3,19 +3,27 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
+import tempfile
 import zipfile
 from pathlib import Path
 
 from netdisk_mcp.baidu import BaiduClient, BaiduError
+from netdisk_mcp.limit import PACE
 from netdisk_mcp.quark import QuarkClient, QuarkError
 from netdisk_mcp.rules import assert_resource_dir, build_dest, choose_category, load_rules, sanitize_title
 from netdisk_mcp.urls import parse_share_url
 
 DOWNLOAD_FAILURE_LIMIT = 3
+CLI_TIMEOUT_SECONDS = 1800
 
 
 class IngestError(RuntimeError):
-    pass
+    def __init__(self, message: str, code: str = ""):
+        super().__init__(message)
+        self.code = code
 
 
 def inspect_share(share_url: str) -> dict:
@@ -495,7 +503,214 @@ def _write_zip(root: Path, written: list[Path], overwrite: bool, skipped: list[d
             archive.write(path, arcname=path.relative_to(root).as_posix())
 
 
+def upload_file_or_folder(
+    local_path: str,
+    dest_dir: str = "",
+    category: str = "",
+    title: str = "",
+    create_share: bool = True,
+    runner=None,
+) -> dict:
+    """把本地文件或文件夹传进夸克资源目录，需要时用官方 CLI，成功后可补永久公开分享。"""
+    source = _validate_local_upload(local_path)
+    rules = load_rules()
+    share_title = sanitize_title(title or source.name)
+    if dest_dir:
+        dest = assert_resource_dir("quark", rules, dest_dir)
+    else:
+        chosen = choose_category(share_title, [source.name], rules, category)
+        dest = build_dest("quark", rules, chosen, share_title)
+    command_prefix = _resolve_cli_command()
+    client = QuarkClient()
+    dest_fid = client.ensure_path(dest)
+    if client.list_files(dest_fid):
+        raise IngestError(
+            f"资源目录已存在且非空，拒绝混入: {dest}。一次上传对应一个空的资源目录，"
+            "已有内容要用 create_share_for_saved_folder 单独处理。",
+            "DEST_NOT_EMPTY",
+        )
+    outcome = _run_cli_upload(command_prefix, source, dest_fid, runner)
+    if source.is_dir():
+        fid = _find_uploaded_folder(client, dest_fid, source.name)
+        if not fid:
+            raise IngestError(f"上传完成但目标目录里没有找到文件夹「{source.name}」，没有创建分享", "UPLOAD_FOLDER_MISSING")
+    else:
+        fid = outcome["fids"][0] if outcome["fids"] else ""
+        if not fid:
+            raise IngestError("官方 CLI 上传结果里没有 fid，没有创建分享", "UPLOAD_FAILED")
+    result = {
+        "ok": True,
+        "provider": "quark",
+        "local_path": str(source),
+        "dest_path": f"{dest}/{source.name}",
+        "fid": fid,
+        "file_name": source.name,
+        "file_size": _local_size(source),
+        "instant_upload": outcome["instant"],
+        "share_created": False,
+    }
+    if not create_share:
+        return result
+    try:
+        share = client.create_share(fid, share_title, 1)
+        checked = client.verify(_pwd_id(share), share["passcode"])
+    except QuarkError as exc:
+        return {
+            "ok": False,
+            "uploaded": True,
+            "error": str(exc),
+            "provider": "quark",
+            "local_path": str(source),
+            "dest_path": result["dest_path"],
+            "fid": fid,
+            "title": share_title,
+            "next": "上传已完成。调用 create_share_for_saved_folder，provider 用 quark，path 用 dest_path，不要分享分类目录。",
+        }
+    result.update(
+        {
+            "title": share_title,
+            "share_created": True,
+            "share_url": share["share_url"],
+            "passcode": share.get("passcode") or "",
+            "expired": "permanent",
+            "verified": True,
+            "verified_count": checked["count"],
+            "next": "只把 share_url 和 passcode 交给封面与闲鱼自动发货。",
+        }
+    )
+    return result
+
+
+def _validate_local_upload(local_path: str) -> Path:
+    raw = Path(str(local_path or "").strip())
+    if not raw.is_absolute():
+        raise IngestError("local_path 必须是绝对路径", "LOCAL_PATH_INVALID")
+    if raw.is_symlink():
+        raise IngestError("local_path 不能是符号链接", "LOCAL_PATH_INVALID")
+    if not raw.exists():
+        raise IngestError(f"本地文件不存在: {raw}", "FILE_NOT_FOUND")
+    if raw.is_dir():
+        has_file = False
+        for entry in raw.rglob("*"):
+            if entry.is_symlink():
+                raise IngestError(f"文件夹里包含符号链接，拒绝上传: {entry}", "LOCAL_PATH_INVALID")
+            if entry.is_file():
+                has_file = True
+        if not has_file:
+            raise IngestError(f"本地文件夹是空的，没有可上传的内容: {raw}", "LOCAL_PATH_INVALID")
+    return raw
+
+
+def _local_size(source: Path) -> int:
+    try:
+        if source.is_file():
+            return source.stat().st_size
+        return sum(path.stat().st_size for path in source.rglob("*") if path.is_file())
+    except OSError:
+        return 0
+
+
+def _resolve_cli_command() -> list[str]:
+    """官方安装脚本不再放全局命令，优先用 QUARK_CLI_SCRIPT 指到 quark-drive.cjs。"""
+    configured = os.getenv("QUARK_CLI_SCRIPT", "").strip()
+    if configured:
+        script = Path(configured)
+        if not script.is_file():
+            raise IngestError(f"QUARK_CLI_SCRIPT 指向的文件不存在: {configured}", "CLI_NOT_FOUND")
+        if script.suffix == ".cjs":
+            node = shutil.which("node")
+            if not node:
+                raise IngestError("运行官方 CLI 需要 node，找不到 node 可执行文件", "CLI_NOT_FOUND")
+            return [node, str(script)]
+        return [str(script)]
+    for name in ("quark-drive", "quarkclouddrive"):
+        found = shutil.which(name)
+        if found:
+            return [found]
+    raise IngestError(
+        "找不到夸克官方 CLI。安装官方 Skills 后，把 QUARK_CLI_SCRIPT 指到其中的 scripts/quark-drive.cjs。",
+        "CLI_NOT_FOUND",
+    )
+
+
+def _run_cli_upload(command_prefix: list[str], source: Path, dest_fid: str, runner) -> dict:
+    """调用官方 CLI upload。上传目录时 CLI 会自己建同名文件夹，fids 只含文件。"""
+    env = {key: value for key, value in os.environ.items() if key not in ("PYTHONPATH", "PYTHONHOME")}
+    timeout = _cli_timeout_seconds()
+    command = [*command_prefix, "upload", str(source), "--parent-fid", dest_fid]
+    PACE.wait()
+    workdir = tempfile.mkdtemp(prefix="netdisk-upload-")
+    try:
+        if runner is not None:
+            completed = runner(command, workdir, env, timeout)
+        else:
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=workdir,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise IngestError(f"官方 CLI 上传超时（{timeout} 秒）", "UPLOAD_FAILED") from exc
+            except OSError as exc:
+                raise IngestError(f"官方 CLI 无法执行: {exc}", "CLI_NOT_FOUND") from exc
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    rows = []
+    for line in (completed.stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
+    result = next(
+        (row for row in reversed(rows) if row.get("action") == "upload" and row.get("type") == "result"),
+        None,
+    )
+    data = (result or {}).get("data") or {}
+    fids = [str(item) for item in data.get("fids") or [] if item]
+    failures = [row for row in rows if row.get("type") == "list" and row.get("code") not in (0, None)]
+    if result is None or int(result.get("code") or 0) != 0 or not fids:
+        detail = (failures[0].get("msg") if failures else "") or (getattr(completed, "stderr", "") or "").strip()[-300:]
+        raise IngestError(f"官方 CLI 上传失败: {detail or '没有返回上传结果'}", "UPLOAD_FAILED")
+    if failures:
+        raise IngestError(
+            f"官方 CLI 上传不完整，{len(failures)} 个文件失败，目标目录可能已有部分文件，没有创建分享: "
+            f"{failures[0].get('msg') or '未知原因'}",
+            "UPLOAD_FAILED",
+        )
+    return {"fids": fids, "instant": bool(data.get("instantUpload"))}
+
+
+def _cli_timeout_seconds() -> int:
+    raw = os.getenv("QUARK_CLI_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return CLI_TIMEOUT_SECONDS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return CLI_TIMEOUT_SECONDS
+
+
+def _find_uploaded_folder(client: QuarkClient, dest_fid: str, name: str) -> str:
+    """列表按更新时间倒序，第一个同名文件夹就是刚上传的。"""
+    for item in client.list_files(dest_fid):
+        if item.get("is_folder") and item.get("name") == name:
+            return str(item.get("fid") or "")
+    return ""
+
+
 def public_error(exc: Exception) -> dict:
     if isinstance(exc, (IngestError, QuarkError, BaiduError, ValueError, RuntimeError)):
-        return {"ok": False, "error": str(exc)}
+        payload = {"ok": False, "error": str(exc)}
+        code = getattr(exc, "code", "")
+        if code:
+            payload["code"] = code
+        return payload
     return {"ok": False, "error": "网盘操作失败"}

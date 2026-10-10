@@ -67,6 +67,7 @@ OpenClaw 注册示例：
 | `inspect_share_tree` | 只读。递归列出夸克分享目录树，不转存 |
 | `selective_ingest` | 只转存夸克分享里选中的路径，再创建自己的永久分享 |
 | `download_share_files` | 把夸克文件下载到本地。分享链接会先把选中项转存到下载缓存，不创建分享 |
+| `upload_file_or_folder` | 把本地文件或文件夹经官方 CLI 上传到资源目录，可选立即创建永久公开分享 |
 
 `ingest_share_link` 发现目标资源目录已经有文件时会停下，避免把旧文件和新文件打成同一条分享。`selective_ingest` 使用同一条规则。
 
@@ -118,6 +119,25 @@ download_share_files(
 建议先把 `max_files` 设为 10 看限流，再放开。`max_files` 和 `max_total_mb` 是硬上限，一触顶就停止，剩下的进 `skipped` 并写明原因。同名文件默认跳过，只有 `overwrite=true` 才覆盖。`local_dir` 必须是绝对路径，不能包含 `..`，也不能是符号链接。
 
 下载和转存共用 `NETDISK_MIN_INTERVAL_SECONDS`（默认 3 秒）。官方 CLI 也是串行取文件，没有公布「第 N 个文件必定被封」的数字，这里没有对生产账号做批量压测。单个文件取地址失败不会作废整批，原因逐条写进 `errors`。取地址和下载遇到 HTTP 429 时同一文件只再试一次；连续 3 个文件失败就中断，避免把账号打进风控。不要并行下载。
+
+## 本地上传并分享
+
+把本地制作、提纯后的成品（单个 zip 或整个文件夹）传回夸克资源目录，然后按上架惯例创建永久公开分享并回读验证：
+
+```text
+upload_file_or_folder(
+  local_path="/Users/you/Products/xxx_通用版.zip",
+  dest_dir="/闲鱼资源/技能/闲鱼实操Skills合集"
+)
+```
+
+`dest_dir` 必须是「根目录/分类/资源名」三级目录；留空时按 `title` 和 `category`（或规则关键词）自动分配。`create_share=false` 只上传不分享。分享失败但上传已成功时，返回 `uploaded=true` 和 `dest_path`，交给 `create_share_for_saved_folder` 补分享。
+
+上传走官方 CLI 的 `upload <路径> --parent-fid <fid>`，支持秒传和断点续传；返回里的 `instant_upload` 表示这次是否命中秒传。安装脚本不再提供全局命令，需要设置 `QUARK_CLI_SCRIPT` 指向官方 Skills 目录里的 `scripts/quark-drive.cjs`（`.cjs` 会自动用 node 执行）。子进程会清掉 `PYTHONPATH` 和 `PYTHONHOME`，在工作目录里运行，超时默认 1800 秒，可用 `QUARK_CLI_TIMEOUT_SECONDS` 调整。
+
+上传文件夹时，CLI 会在资源目录下创建同名文件夹再递归上传，分享的就是这个文件夹；上传单个文件时分享这个文件本身。目标资源目录必须为空，已有内容会以 `DEST_NOT_EMPTY` 拒绝，避免新旧文件混进同一条分享。
+
+本地路径必须是绝对路径且不能是符号链接，文件夹内部也不允许包含符号链接（CLI 会跟随符号链接，可能把指向任意位置的内容传上网盘）；空文件夹会被拒绝，且不发起任何网盘请求。文件夹里有文件失败时同样拒绝创建分享，此时目标目录可能已有部分文件。失败返回带 `code`：`FILE_NOT_FOUND`、`LOCAL_PATH_INVALID`、`CLI_NOT_FOUND`、`DEST_NOT_EMPTY`、`UPLOAD_FAILED`、`UPLOAD_FOLDER_MISSING`。
 
 ## 分享规则
 

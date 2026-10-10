@@ -16,6 +16,7 @@ from netdisk_mcp.pipeline import (
     inspect_share_tree as read_share_tree,
     public_error,
     selective_ingest as ingest_selection,
+    upload_file_or_folder as run_local_upload,
     verify_share,
 )
 from netdisk_mcp.quark import QuarkClient, quark_auth_configured
@@ -156,6 +157,34 @@ def download_share_files(
                 max_total_mb=max_total_mb,
                 make_zip=make_zip,
                 overwrite=overwrite,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _dump(public_error(exc))
+
+
+@mcp.tool()
+def upload_file_or_folder(
+    local_path: str,
+    dest_dir: str = "",
+    category: str = "",
+    title: str = "",
+    create_share: bool = True,
+) -> str:
+    """把本地文件或文件夹上传到夸克资源目录，用官方 CLI，可选立即创建永久公开分享并回读验证。
+
+    local_path 必须是绝对路径，不能是符号链接。dest_dir 必须是「根目录/分类/资源名」三级目录，
+    留空时按 title 和规则自动分配。create_share=false 只上传不分享。
+    需要 QUARK_CLI_SCRIPT 指向官方 quark-drive.cjs。
+    """
+    try:
+        return _dump(
+            run_local_upload(
+                local_path,
+                dest_dir=dest_dir,
+                category=category,
+                title=title,
+                create_share=create_share,
             )
         )
     except Exception as exc:  # noqa: BLE001
